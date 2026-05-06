@@ -1,0 +1,4 @@
+interface:
+  display_name: "Travel Planner"
+  short_description: "Plan trips, routes, budgets, and itineraries"
+  default_prompt: "Use $travel-planner to turn my destination ideas into a practical trip plan."
