@@ -13,6 +13,7 @@
 - 默认核实签证、入境、天气、开放时间、票价、交通时刻等易变信息
 - 支持城市区域对比、点到点路线估算和景点地理聚类
 - 输出按天行程、预算范围、预订清单、风险提示和备选方案
+- 可选视觉交付：搜索插图素材，生成带图 HTML 行程页，再按环境导出图片或 PDF
 
 ## 安装到 Codex
 
@@ -66,4 +67,3 @@ export AMAP_API_KEY="your-amap-api-key"
 ## 更新方式
 
 Codex 和 Claude Code 两个版本目前内容保持一致，区别只是 Codex 版本额外包含 `agents/openai.yaml`。更新时建议先改 `codex/travel-planner/`，再同步到 `claude-code/travel-planner/`，同步时不要复制 `agents/`。
-
