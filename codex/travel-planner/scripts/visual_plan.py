@@ -81,6 +81,44 @@ def render_route(route: list[Any]) -> str:
     """
 
 
+def render_visual_anchors(items: list[Any]) -> str:
+    cards = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        image = item.get("image") or item.get("photo")
+        src = image_src(image)
+        if not src:
+            continue
+        credit = image_credit_html(image)
+        day = escape(item.get("day") or item.get("label") or "")
+        name = escape(item.get("name") or item.get("title") or "")
+        description = escape(item.get("description") or item.get("note") or "")
+        cards.append(
+            f"""
+            <article class="anchor-card">
+              <figure>
+                <img src="{escape(src)}" alt="{name or day or 'Travel highlight'}" loading="lazy">
+                {f'<figcaption>{credit}</figcaption>' if credit else ''}
+              </figure>
+              <div>
+                {f'<span>{day}</span>' if day else ''}
+                {f'<h3>{name}</h3>' if name else ''}
+                {f'<p>{description}</p>' if description else ''}
+              </div>
+            </article>
+            """
+        )
+    if not cards:
+        return ""
+    return f"""
+    <section class="visual-anchors">
+      <h2>Visual Anchors</h2>
+      <div class="anchor-grid">{"".join(cards)}</div>
+    </section>
+    """
+
+
 def render_day(day: dict[str, Any], index: int) -> str:
     image = day.get("image") or day.get("photo")
     src = image_src(image)
@@ -292,7 +330,7 @@ def build_html(data: dict[str, Any]) -> str:
       font-size: 22px;
       letter-spacing: 0;
     }}
-    .route, .budget, .checklist, footer {{
+    .route, .visual-anchors, .budget, .checklist, footer {{
       margin: 26px 0;
       padding: 22px;
       border: 1px solid var(--line);
@@ -313,6 +351,42 @@ def build_html(data: dict[str, Any]) -> str:
       background: #e5f3ef;
       color: var(--deep);
       font-weight: 700;
+    }}
+    .anchor-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }}
+    .anchor-card {{
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+    }}
+    .anchor-card figure img {{
+      aspect-ratio: 4 / 3;
+    }}
+    .anchor-card div {{
+      padding: 14px;
+    }}
+    .anchor-card span {{
+      display: block;
+      color: var(--accent-2);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }}
+    .anchor-card h3 {{
+      margin: 6px 0 6px;
+      font-size: 20px;
+      line-height: 1.18;
+      letter-spacing: 0;
+    }}
+    .anchor-card p {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
     }}
     .days {{
       display: grid;
@@ -426,6 +500,7 @@ def build_html(data: dict[str, Any]) -> str:
     <div class="content">
       {f'<section class="meta-grid">{meta}</section>' if meta else ''}
       {render_route(as_list(data.get("route")))}
+      {render_visual_anchors(as_list(data.get("visual_anchors") or data.get("highlights")))}
       <section class="days">{days}</section>
       {render_budget(as_list(data.get("budget")))}
       {render_checklist(as_list(data.get("checklist")))}
