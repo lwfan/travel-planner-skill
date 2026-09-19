@@ -260,6 +260,18 @@ python3 scripts/map_tools.py compare-areas --areas 崇文门 前门 东直门 --
 
 默认参考 `references/plan-template.md`，按任务裁剪，不要机械填满。
 
+### 文件输出目录
+
+需要生成文件时，先读取 `references/output-directory.md`，确定本次行程目录后再写入产物。纯聊天、需求澄清或单项查询不创建目录。
+
+用户明确指定的输出路径优先。否则，通用工作目录使用 `旅行计划/<单次行程>/`，专属旅游总目录直接使用 `<单次行程>/`；已有单次行程中的修改、方案切换和导出复用原目录，不因标题或格式变化重复嵌套。
+
+未指定输出路径时，使用 `scripts/output_paths.py` 解析目录，需要落盘时加 `--create` 创建目录和标记。自动识别仅依据精确集合名、有效标记和受限祖先查找；不确定时按通用工作目录处理。用户明确说明非标准名称的目录是旅游总目录时，传 `--workspace-type travel`，无需额外确认。
+
+本次生成的 JSON、Markdown、HTML、PNG、PDF、文档、图片素材及渲染辅助脚本都保存在同一个行程目录内，素材可用子目录。多个候选方案用不同文件名区分；所有产物沿用同一次目录解析结果，不分散到工作目录根部或 skill 安装目录。
+
+### 交付内容
+
 如果用户要求“好看一点”“带图版”“一图流”“长图”“做成文档”“HTML/网页/海报/攻略卡片”，读取 `references/visual-output.md` 走视觉交付流程。新建行程先完成事实核实和路线设计；仅转换格式时按第 0 节沿用既有内容，必要时才补查。
 
 如果是新建完整行程且仍需要澄清，优先输出：
@@ -313,6 +325,7 @@ python3 scripts/map_tools.py compare-areas --areas 崇文门 前门 东直门 --
 - 是否把“推荐”说成了“确定事实”？
 - 是否给出了至少一个天气/体力/预算维度的备选？
 - 是否把关键日期、金额、时长写清楚？
+- 文件产物是否集中在本次行程目录，遵守用户指定路径，并在后续修改与导出时复用原目录？
 - 如果生成视觉版，图片来源是否可解释，版式是否先服务行程信息而不是只追求装饰？
 
 ## 参考文件
@@ -320,4 +333,5 @@ python3 scripts/map_tools.py compare-areas --areas 崇文门 前门 东直门 --
 - `references/plan-template.md`：旅行方案输出模板、候选对比维度、按天行程骨架
 - `references/search-strategy.md`：按任务类型拆解的搜索顺序、来源优先级和 fallback 规则
 - `references/map-tools.md`：高德轻量地图能力的命令、适用场景和解读方式
+- `references/output-directory.md`：行程目录识别、命名、创建和所有文件产物的归集规则
 - `references/visual-output.md`：带图文档、一图流、HTML 视觉行程页的生成策略

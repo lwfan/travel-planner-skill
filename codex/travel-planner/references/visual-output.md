@@ -4,6 +4,8 @@
 
 如果用户只是把现有方案换成另一种输出形式，沿用已确认的需求和已核实内容，不重新发旅行问卷或全量搜索路线。只有明显过期、缺失或相互矛盾的信息会影响交付时，才针对该项补查。
 
+先按 `output-directory.md` 确定本次行程目录。结构化 JSON、HTML、导出的 PNG/PDF、保存的图片和本次生成的渲染辅助脚本都放在该目录内；多方案与摘要版使用不同文件名，后续导出复用同一目录。
+
 ## 1. 先判断交付形态
 
 优先级：
@@ -163,19 +165,32 @@
 
 ## 5. HTML 生成
 
-使用脚本：
+推荐先创建行程目录，再将本次 JSON 写入返回的目录：
 
 ```bash
-python3 scripts/visual_plan.py plan.json --output travel-plan.html
+python3 scripts/output_paths.py --workspace "/path/to/workspace" --trip-name "北京3天" --create
+python3 scripts/visual_plan.py "/path/to/workspace/旅行计划/北京3天/plan.json"
 ```
 
-本地图片的相对路径按 **JSON 文件所在目录** 解析，与运行命令的目录无关。脚本会先校验全部数据并读取本地图片，再生成 HTML；读取失败会报告具体图片字段，不会用断图替代成功交付。输出目录不存在时会自动创建。
+未指定 `--output` 时，脚本将 HTML 托管在行程目录内，默认文件名为 `travel-plan.html`。支持 `--workspace`、`--workspace-type auto|general|travel` 和 `--trip-name`，目录选择规则见 `output-directory.md`。
 
-例如 `specs/plan.json` 引用 `assets/day.svg`，导出到 `exports/travel-plan.html` 时，脚本读取 `specs/assets/day.svg`，将素材复制到 `exports/travel-plan-assets/`，并使用相对链接引用。转发或移动时，将 HTML 和相邻的 `travel-plan-assets` 文件夹一起打包，保留目录关系。图片按内容生成文件名，相同素材可复用。
+未显式传 `--workspace`，且输入 JSON 位于有有效标记的单次行程内时，直接复用该行程目录，修改 JSON 标题不会另建目录。否则使用指定工作目录或当前工作目录解析；没有已有行程上下文且未指定 `--trip-name` 时，从 JSON 的 `title` 或输入文件名生成安全目录名。自动名称会将不安全字符替换为短横线，不超过 80 个字符且符合目录长度限制；显式 `--trip-name` 由目录工具严格验证，不会静默改名。
 
-HTTP(S)、协议相对 URL 和 `data:` 图片保留原地址，脚本不联网下载；网络图片仍需在截图前确认加载成功。只希望生成 HTML 字符串时使用 `build_html(data)`；需要解析并打包本地素材时使用上面的 CLI，或 Python 的 `write_plan(data, spec_dir, output_path)`（后两个参数为 `Path`）。
+自动名称与已有非空行程目录重名时拒绝覆盖，不自行添加后缀。修订时使用原行程内的 JSON 或显式 `--trip-name` 复用；新旅行优先按已知日期、目的地和时长命名。
 
-如果运行环境支持浏览器或 Playwright，可以再把 HTML 导出为 PNG/PDF。导出前需要检查：
+用户明确指定 `--output` 时，按给定文件路径输出，覆盖自动托管规则；相对路径始终按进程当前目录解析，`--workspace` 等托管参数不参与。此模式只创建目标父目录和必要的素材目录，不额外创建旅行集合或标记。多方案使用本次行程内的明确路径，例如：
+
+```bash
+python3 scripts/visual_plan.py "/path/to/workspace/旅行计划/北京3天/plan-b.json" --output "/path/to/workspace/旅行计划/北京3天/plan-b.html"
+```
+
+本地图片的相对路径按 **JSON 文件所在目录** 解析，与运行命令的目录无关。脚本会先校验全部数据并读取本地图片，再生成 HTML；读取失败会报告具体图片字段，不会用断图替代成功交付。
+
+例如行程目录内的 `plan.json` 引用 `assets/day.svg`，导出 `travel-plan.html` 时，脚本读取同一行程内的素材，将图片复制到相邻的 `travel-plan-assets/`，并使用相对链接引用。转发时，将 HTML 和相邻素材文件夹一起打包，保留目录关系。图片按内容生成文件名，相同素材可复用。
+
+HTTP(S)、协议相对 URL 和 `data:` 图片保留原地址，脚本不联网下载；网络图片仍需在截图前确认加载成功。只希望生成 HTML 字符串时使用 `build_html(data)`；需要解析并打包本地素材时使用上面的 CLI，或 Python 的 `write_plan(data, spec_dir, output_path)`（后两个参数为 `Path`）。`write_plan` 采用明确输出路径，不自动选择行程目录。
+
+如果运行环境支持浏览器或 Playwright，可以再把 HTML 导出为同一行程目录内的 PNG/PDF。导出前需要检查：
 
 - 图片是否全部加载成功
 - 每个核心视觉锚点是否有对应图片；无图时是否明确说明，而不是用错图替代

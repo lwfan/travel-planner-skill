@@ -16,6 +16,7 @@ from urllib.parse import unquote
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "codex/travel-planner/scripts/visual_plan.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("visual_plan", SCRIPT)
 visual_plan = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(visual_plan)
@@ -27,7 +28,7 @@ class VisualPlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="visual-plan-test-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.spec_dir = self.root / "specs"
         self.spec_dir.mkdir()
 
@@ -164,6 +165,82 @@ class VisualPlanTests(unittest.TestCase):
         })
         self.assertIn("公园", rendered)
         self.assertIn("公交往返", rendered)
+
+    def run_managed_cli(self, data, *options: str, spec_dir: Path | None = None) -> subprocess.CompletedProcess:
+        spec_path = (spec_dir or self.spec_dir) / "plan.json"
+        spec_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), str(spec_path), *options],
+            cwd=self.root, capture_output=True, text=True,
+        )
+
+    def test_default_output_groups_trip_and_local_assets(self) -> None:
+        (self.spec_dir / "photo.svg").write_bytes(TINY_SVG)
+        result = self.run_managed_cli({"title": "京都/大阪 5日游", "days": [{"area": "京都", "image": "photo.svg"}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        trip = self.root / "旅行计划" / "京都-大阪-5日游"
+        output = trip / "travel-plan.html"
+        self.assertEqual(Path(result.stdout.strip()), output)
+        self.assertTrue(output.is_file())
+        self.assertTrue((trip / ".travel-planner.json").is_file())
+        self.assertEqual(len(list((trip / "travel-plan-assets").iterdir())), 1)
+        self.assertFalse((self.root / "travel-plan.html").exists())
+
+    def test_explicit_dedicated_workspace_puts_trip_directly_under_it(self) -> None:
+        dedicated = self.root / "假期安排"
+        dedicated.mkdir()
+        result = self.run_managed_cli({"route": ["杭州"]}, "--workspace", str(dedicated),
+                                      "--workspace-type", "travel", "--trip-name", "杭州周末")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((dedicated / "杭州周末" / "travel-plan.html").is_file())
+        self.assertFalse((dedicated / "旅行计划").exists())
+
+    def test_long_unicode_display_title_still_produces_a_valid_folder(self) -> None:
+        title = "🏖" * 90
+        result = self.run_managed_cli({"title": title, "route": ["海边"]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = Path(result.stdout.strip())
+        self.assertEqual(output.parent.parent, self.root / "旅行计划")
+        self.assertIn(title, output.read_text())
+
+    def test_automatic_title_collision_preserves_previous_trip(self) -> None:
+        first = self.run_managed_cli({"title": "北京/上海", "route": ["北京"]})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        output = Path(first.stdout.strip())
+        previous = output.read_bytes()
+        second = self.run_managed_cli({"title": "北京:上海", "route": ["上海"]})
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("--trip-name", second.stderr)
+        self.assertEqual(output.read_bytes(), previous)
+        explicit = self.run_managed_cli({"title": "北京:上海", "route": ["上海"]}, "--trip-name", output.parent.name)
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertNotEqual(output.read_bytes(), previous)
+
+    def test_spec_in_existing_trip_reuses_folder_when_title_changes(self) -> None:
+        trip = Path(visual_plan.ensure_trip_directory(self.root, "上海3日")["path"])
+        result = self.run_managed_cli({"title": "全新的显示标题", "route": ["上海"]}, spec_dir=trip)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), trip / "travel-plan.html")
+        self.assertIn("全新的显示标题", (trip / "travel-plan.html").read_text())
+        self.assertFalse((trip / "旅行计划").exists())
+        self.assertFalse((trip.parent / "全新的显示标题").exists())
+
+    def test_explicit_output_overrides_managed_parameters(self) -> None:
+        result = self.run_managed_cli({"route": ["上海"]}, "--output", "custom/onepage.html",
+                                      "--workspace", str(self.root / "ignored"), "--trip-name", "上海")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "custom" / "onepage.html").is_file())
+        self.assertFalse((self.root / "custom" / ".travel-planner.json").exists())
+        self.assertFalse((self.root / "ignored").exists())
+        self.assertFalse((self.root / "旅行计划").exists())
+
+    def test_invalid_managed_input_creates_no_trip_directory(self) -> None:
+        for data in ({"days": [{"morning": []}]}, {"days": [{"area": "城区", "image": "missing.svg"}]}):
+            with self.subTest(data=data):
+                result = self.run_managed_cli(data, "--trip-name", "上海3日")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse((self.root / "旅行计划").exists())
 
 
 if __name__ == "__main__":

@@ -11,9 +11,12 @@ import json
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
+
+from output_paths import MissingTripNameError, ensure_trip_directory, resolve_trip_directory
 
 
 def validate_text(value: Any, path: str, *, number: bool = False) -> None:
@@ -188,12 +191,16 @@ def prepare_local_images(
     return prepared, assets
 
 
-def write_plan(data: Any, spec_dir: Path, output_path: Path) -> None:
-    """Validate and package a portable HTML plus its local image directory."""
+def _prepare_plan(data: Any, spec_dir: Path, output_path: Path) -> tuple[str, dict[str, bytes]]:
+    """Validate and read all inputs before creating any output directories."""
     validate_plan(data)
     asset_dir_name = output_path.stem + "-assets"
     prepared, assets = prepare_local_images(data, spec_dir, asset_dir_name)
-    rendered = build_html(prepared)
+    return build_html(prepared), assets
+
+
+def _write_plan_files(rendered: str, assets: dict[str, bytes], output_path: Path) -> None:
+    asset_dir_name = output_path.stem + "-assets"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # Stage the complete page before replacing an existing HTML output.
     with tempfile.TemporaryDirectory(prefix=".travel-plan-", dir=output_path.parent) as temp_dir:
@@ -210,6 +217,12 @@ def write_plan(data: Any, spec_dir: Path, output_path: Path) -> None:
             for filename in assets:
                 (staged_assets / filename).replace(asset_dir / filename)
         staged_html.replace(output_path)
+
+
+def write_plan(data: Any, spec_dir: Path, output_path: Path) -> None:
+    """Validate and package a portable HTML at an explicitly supplied path."""
+    rendered, assets = _prepare_plan(data, spec_dir, output_path)
+    _write_plan_files(rendered, assets, output_path)
 
 
 def render_meta(items: list[Any]) -> str:
@@ -683,19 +696,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         "-o",
-        default="travel-plan.html",
-        help="Output HTML path. Defaults to travel-plan.html.",
+        help="Explicit HTML path; overrides managed directory placement.",
     )
+    parser.add_argument("--workspace", help="Workspace to classify. Defaults to the current trip or working directory.")
+    parser.add_argument("--workspace-type", choices=("auto", "general", "travel"), default="auto",
+                        help="Directory purpose; defaults to auto detection.")
+    parser.add_argument("--trip-name", help="Trip folder name. Defaults to the existing trip, JSON title, or spec filename.")
     return parser.parse_args()
+
+
+def managed_destination(args: argparse.Namespace, data: Any, spec_path: Path) -> tuple[Path, str | None, dict]:
+    workspace = Path(args.workspace).expanduser() if args.workspace else Path.cwd()
+    # A spec saved in a managed trip keeps its outputs there, even when invoked
+    # from a general workspace. An explicit workspace always takes precedence.
+    if not args.workspace:
+        try:
+            context = resolve_trip_directory(spec_path.parent, None)
+        except MissingTripNameError:
+            pass
+        else:
+            if context["workspace_type"] == "trip":
+                workspace = spec_path.parent
+    trip_name = args.trip_name
+    try:
+        destination = resolve_trip_directory(workspace, trip_name, workspace_type=args.workspace_type)
+    except MissingTripNameError:
+        title = data.get("title") if isinstance(data, dict) else None
+        label = title if isinstance(title, str) and title.strip() else spec_path.stem
+        label = "".join("-" if unicodedata.category(char).startswith("C") else char for char in label)
+        trip_name = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f\s]+', "-", label).strip(".- ")[:80].rstrip(".- ") or "行程"
+        trip_name = trip_name.encode("utf-8")[:240].decode("utf-8", errors="ignore").rstrip(".- ")
+        destination = resolve_trip_directory(workspace, trip_name, workspace_type=args.workspace_type)
+        target = Path(destination["path"])
+        if target.exists() and next(target.iterdir(), None) is not None:
+            raise FileExistsError(
+                f"Automatically named trip directory already exists: {target}. "
+                "To update it, explicitly select --trip-name or use a spec saved inside that trip."
+            )
+    return workspace, trip_name, destination
 
 
 def main() -> int:
     args = parse_args()
-    spec_path = Path(args.spec)
-    output_path = Path(args.output)
     try:
+        spec_path = Path(args.spec).expanduser().resolve()
         data = json.loads(spec_path.read_text(encoding="utf-8"))
-        write_plan(data, spec_path.resolve().parent, output_path)
+        managed = None
+        if args.output:
+            output_path = Path(args.output).expanduser()
+        else:
+            managed = managed_destination(args, data, spec_path)
+            output_path = Path(managed[2]["path"]) / "travel-plan.html"
+        rendered, assets = _prepare_plan(data, spec_path.parent, output_path)
+        if managed is not None:
+            ensure_trip_directory(managed[0], managed[1], workspace_type=args.workspace_type)
+        _write_plan_files(rendered, assets, output_path)
     except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
