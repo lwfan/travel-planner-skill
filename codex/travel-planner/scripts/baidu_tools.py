@@ -14,6 +14,12 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from map_common import (
+    DEFAULT_MAX_WALK_KM, DEFAULT_MAX_WALK_MINUTES, MapError,
+    call_safely, check_fallback_walk, compare_routes, first_route, number,
+    optional_number, options_from_args, route_list, route_options, validate_walk_limits,
+)
+
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_CANDIDATES = (
@@ -95,13 +101,20 @@ def fetch_json(uri: str, params: list[tuple[str, str]]) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"Baidu Map request failed: {exc}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise MapError("network_error", f"Baidu Map request failed: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise MapError("invalid_response", "Baidu Map returned invalid JSON") from exc
 
-    status = int(payload.get("status", -1))
+    if not isinstance(payload, dict):
+        raise MapError("invalid_response", "Baidu Map returned a non-object response")
+    try:
+        status = int(payload.get("status", -1))
+    except (TypeError, ValueError) as exc:
+        raise MapError("invalid_response", "Baidu Map returned an invalid status") from exc
     if status != 0:
         message = payload.get("message") or payload.get("msg") or f"status={status}"
-        raise SystemExit(f"Baidu Map API error: {message}")
+        raise MapError("api_error", f"Baidu Map API error: {message}")
     return payload
 
 
@@ -138,9 +151,16 @@ def _baidu_coord(geo: dict) -> str:
     return f"{geo['location']['lat']},{geo['location']['lng']}"
 
 
-def route(origin: str, destination: str, mode: str, city: str | None) -> dict:
-    origin_geo = geocode(origin, city)
-    destination_geo = geocode(destination, city)
+def route(origin: str, destination: str, mode: str, city: str | None,
+          *, origin_city: str | None = None, destination_city: str | None = None,
+          max_walk_km: float = DEFAULT_MAX_WALK_KM,
+          max_walk_minutes: float = DEFAULT_MAX_WALK_MINUTES) -> dict:
+    if mode not in {"walking", "driving", "taxi", "transit"}:
+        raise MapError("unsupported", f"Baidu adapter does not implement mode: {mode}; use AMap")
+    validate_walk_limits(max_walk_km, max_walk_minutes)
+    origin_hint, destination_hint = origin_city or city, destination_city or city
+    origin_geo = geocode(origin, origin_hint)
+    destination_geo = geocode(destination, destination_hint)
     base_params = [
         ("origin", _baidu_coord(origin_geo)),
         ("destination", _baidu_coord(destination_geo)),
@@ -151,92 +171,65 @@ def route(origin: str, destination: str, mode: str, city: str | None) -> dict:
 
     if mode == "walking":
         payload = fetch_json("/directionlite/v1/walking", base_params)
-        route_data = payload["result"]["routes"][0]
+        route_data = first_route(payload, "result", "routes")
         details = {
             "steps": len(route_data.get("steps", [])),
         }
         resolved_mode = "walking"
-    elif mode == "driving":
+    elif mode in {"driving", "taxi"}:
         payload = fetch_json("/directionlite/v1/driving", base_params)
-        route_data = payload["result"]["routes"][0]
+        route_data = first_route(payload, "result", "routes")
         details = {
-            "toll_cny": float(route_data.get("toll", 0)),
+            "toll_cny": optional_number(route_data.get("toll"), "toll"),
             "traffic_condition": route_data.get("traffic_condition"),
         }
+        if mode == "taxi":
+            details["estimate_note"] = "Driving-time estimate for a taxi; excludes waiting and does not quote a fare"
         resolved_mode = "driving"
     elif mode == "transit":
         transit_params = list(base_params)
-        if city:
-            transit_params.append(("origin_region", city))
-            transit_params.append(("destination_region", city))
-        try:
-            payload = fetch_json("/directionlite/v1/transit", transit_params)
-            route_data = payload["result"]["routes"][0]
+        if origin_hint:
+            transit_params.append(("origin_region", origin_hint))
+        if destination_hint:
+            transit_params.append(("destination_region", destination_hint))
+        payload = fetch_json("/directionlite/v1/transit", transit_params)
+        routes = route_list(payload, "result", "routes")
+        if routes:
+            route_data = routes[0]
             details = {
-                "price_cny": float(route_data.get("price", 0)),
+                "price_cny": optional_number(route_data.get("price"), "price"),
                 "steps": len(route_data.get("steps", [])),
             }
             resolved_mode = "transit"
-        except SystemExit as exc:
+        else:
+            if max_walk_km == 0 or max_walk_minutes == 0:
+                raise MapError("no_route", "No public transport route; walking fallback is disabled")
             payload = fetch_json("/directionlite/v1/walking", base_params)
-            route_data = payload["result"]["routes"][0]
+            route_data = first_route(payload, "result", "routes")
+            check_fallback_walk(route_data, max_walk_km, max_walk_minutes)
             details = {
                 "steps": len(route_data.get("steps", [])),
-                "fallback_reason": str(exc),
+                "fallback_reason": "no public transport route found; short walk offered as an alternative",
+                "fallback_from": mode,
+                "max_walk_km": max_walk_km, "max_walk_minutes": max_walk_minutes,
             }
             resolved_mode = "walking"
-    else:
-        raise SystemExit(f"Unsupported mode: {mode}")
 
     return {
+        "status": "ok",
         "mode": mode,
         "resolved_mode": resolved_mode,
         "origin": origin_geo,
         "destination": destination_geo,
-        "duration_minutes": round(float(route_data["duration"]) / 60, 1),
-        "distance_km": round(float(route_data["distance"]) / 1000, 2),
+        "duration_minutes": round(number(route_data.get("duration"), "duration") / 60, 1),
+        "distance_km": round(number(route_data.get("distance"), "distance") / 1000, 2),
         "details": details,
     }
 
 
-def compare_areas(areas: list[str], anchors: list[str], mode: str, city: str | None) -> dict:
-    if len(areas) < 2:
-        raise SystemExit("compare-areas requires at least two areas")
-    if not anchors:
-        raise SystemExit("compare-areas requires at least one anchor")
-
-    results = []
-    for area in areas:
-        anchor_routes = []
-        total_minutes = 0.0
-        for anchor in anchors:
-            route_result = route(area, anchor, mode, city)
-            anchor_routes.append(
-                {
-                    "anchor": anchor,
-                    "resolved_mode": route_result["resolved_mode"],
-                    "duration_minutes": route_result["duration_minutes"],
-                    "distance_km": route_result["distance_km"],
-                }
-            )
-            total_minutes += route_result["duration_minutes"]
-            if mode == "transit":
-                time.sleep(0.2)
-        results.append(
-            {
-                "area": area,
-                "average_duration_minutes": round(total_minutes / len(anchors), 1),
-                "anchors": anchor_routes,
-            }
-        )
-
-    results.sort(key=lambda item: item["average_duration_minutes"])
-    return {
-        "mode": mode,
-        "city": city,
-        "anchors": anchors,
-        "ranked_areas": results,
-    }
+def compare_areas(areas: list[str], anchors: list[str], mode: str, city: str | None, **options) -> dict:
+    return compare_routes(areas, anchors, mode, city,
+                          lambda area, anchor: call_safely(route, area, anchor, mode, city, **options))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -250,22 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
     route_parser = subparsers.add_parser("route")
     route_parser.add_argument("--origin", required=True)
     route_parser.add_argument("--destination", required=True)
-    route_parser.add_argument(
-        "--mode",
-        choices=("walking", "driving", "transit"),
-        default="transit",
-    )
-    route_parser.add_argument("--city")
+    route_options(route_parser)
 
     compare_parser = subparsers.add_parser("compare-areas")
     compare_parser.add_argument("--areas", nargs="+", required=True)
     compare_parser.add_argument("--anchors", nargs="+", required=True)
-    compare_parser.add_argument(
-        "--mode",
-        choices=("walking", "driving", "transit"),
-        default="transit",
-    )
-    compare_parser.add_argument("--city")
+    route_options(compare_parser)
     return parser
 
 
@@ -274,17 +257,17 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "geocode":
-        result = geocode(args.query, args.city)
+        result = call_safely(geocode, args.query, args.city)
     elif args.command == "route":
-        result = route(args.origin, args.destination, args.mode, args.city)
+        result = call_safely(route, args.origin, args.destination, args.mode, args.city, **options_from_args(args))
     elif args.command == "compare-areas":
-        result = compare_areas(args.areas, args.anchors, args.mode, args.city)
+        result = call_safely(compare_areas, args.areas, args.anchors, args.mode, args.city, **options_from_args(args))
     else:
         raise SystemExit(f"Unknown command: {args.command}")
 
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
-    return 0
+    return 0 if result["status"] == "ok" else 1
 
 
 if __name__ == "__main__":

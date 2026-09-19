@@ -4,10 +4,97 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import html
 import json
+import re
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote, urlsplit
+
+
+def validate_text(value: Any, path: str, *, number: bool = False) -> None:
+    if value is None or isinstance(value, str):
+        return
+    if number and type(value) in (int, float):
+        return
+    raise ValueError(f"{path}: expected {'text or a number' if number else 'text'}.")
+
+
+def validate_image(value: Any, path: str) -> None:
+    if value is None or isinstance(value, str):
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: expected an image path/URL or an image object.")
+    for key in ("src", "caption", "credit", "source_url", "url"):
+        validate_text(value.get(key), f"{path}.{key}")
+
+
+def has_text(value: Any) -> bool:
+    return value is not None and bool(str(value).strip())
+
+
+def validate_plan(data: Any) -> None:
+    """Validate supported fields without requiring a full day-by-day itinerary."""
+    if not isinstance(data, dict):
+        raise ValueError("$: expected a JSON object.")
+    for key in ("title", "subtitle"):
+        validate_text(data.get(key), key)
+    for key in ("hero_image", "hero"):
+        validate_image(data.get(key), key)
+
+    has_content = False
+    for key in ("route", "checklist"):
+        for index, item in enumerate(as_list(data.get(key))):
+            path = f"{key}[{index}]"
+            validate_text(item, path)
+            if not has_text(item):
+                raise ValueError(f"{path}: expected non-empty text.")
+            has_content = True
+
+    for key in ("meta", "budget", "sources"):
+        for index, item in enumerate(as_list(data.get(key))):
+            path = f"{key}[{index}]"
+            if isinstance(item, dict):
+                fields = ("title", "url") if key == "sources" else ("label", "value")
+                for field in fields:
+                    validate_text(item.get(field), f"{path}.{field}", number=field == "value")
+                nonempty = any(has_text(item.get(field)) for field in fields)
+            else:
+                validate_text(item, path)
+                nonempty = has_text(item)
+            if not nonempty:
+                raise ValueError(f"{path}: expected a non-empty entry.")
+            if key != "sources":
+                has_content = True
+
+    day_fields = ("day", "date", "area", "title", "morning", "afternoon", "evening", "transport", "food", "backup", "note")
+    anchor_fields = ("day", "label", "name", "title", "description", "note")
+    for key in ("days", "visual_anchors", "highlights"):
+        for index, item in enumerate(as_list(data.get(key))):
+            path = f"{key}[{index}]"
+            if not isinstance(item, dict):
+                raise ValueError(f"{path}: expected an object.")
+            fields = day_fields if key == "days" else anchor_fields
+            for field in fields:
+                validate_text(item.get(field), f"{path}.{field}", number=field == "day")
+            for field in ("image", "photo"):
+                validate_image(item.get(field), f"{path}.{field}")
+            notes = as_list(item.get("notes")) if key == "days" else []
+            for note_index, note in enumerate(notes):
+                validate_text(note, f"{path}.notes[{note_index}]")
+            meaningful_fields = [field for field in fields if field not in ("day", "date", "label")]
+            if not (any(has_text(item.get(field)) for field in meaningful_fields)
+                    or any(has_text(note) for note in notes)
+                    or image_src(item.get("image") or item.get("photo"))):
+                raise ValueError(f"{path}: add a place, activity, note, or image.")
+            has_content = True
+
+    if not has_content:
+        raise ValueError("$: add non-empty route, days, visual_anchors, meta, budget, or checklist content.")
 
 
 def as_list(value: Any) -> list[Any]:
@@ -30,9 +117,9 @@ def escape(value: Any) -> str:
 
 def image_src(image: Any) -> str:
     if isinstance(image, str):
-        return image
+        return image.strip()
     if isinstance(image, dict):
-        return text(image.get("src"))
+        return text(image.get("src")).strip()
     return ""
 
 
@@ -45,13 +132,84 @@ def image_credit(image: Any) -> str:
 
 def image_credit_html(image: Any) -> str:
     credit = image_credit(image)
-    if not credit:
-        return ""
     if isinstance(image, dict):
         source_url = text(image.get("source_url") or image.get("url")).strip()
         if source_url:
-            return f'<a href="{escape(source_url)}">{escape(credit)}</a>'
+            return f'<a href="{escape(source_url)}">{escape(credit or "图片来源")}</a>'
     return escape(credit)
+
+
+def prepare_local_images(
+    data: dict[str, Any], spec_dir: Path, asset_dir_name: str
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Read all local assets before writing anything; leave network images as URLs."""
+    prepared = copy.deepcopy(data)
+    images = [(prepared, key, key) for key in ("hero_image", "hero")]
+    for key in ("days", "visual_anchors", "highlights"):
+        for index, item in enumerate(as_list(prepared.get(key))):
+            images.extend((item, field, f"{key}[{index}].{field}") for field in ("image", "photo"))
+
+    assets = {}
+    for owner, key, path in images:
+        image = owner.get(key)
+        src = image_src(image)
+        if not src:
+            continue
+        try:
+            parsed = urlsplit(src)
+        except ValueError as exc:
+            raise ValueError(f"{path}: invalid image URL: {exc}") from exc
+        if parsed.scheme.lower() in ("http", "https", "data") or src.startswith("//"):
+            continue
+        if parsed.scheme.lower() == "file":
+            if parsed.netloc not in ("", "localhost"):
+                raise ValueError(f"{path}: file URLs must refer to a local file.")
+            source_path = Path(unquote(parsed.path))
+        elif parsed.scheme:
+            raise ValueError(f"{path}: unsupported image URL scheme {parsed.scheme!r}.")
+        else:
+            source_path = Path(src).expanduser()
+        if not source_path.is_absolute():
+            source_path = spec_dir / source_path
+        try:
+            content = source_path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"{path}: cannot read local image {source_path}: {exc.strerror or exc}") from exc
+        suffix = source_path.suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+            suffix = ".bin"
+        filename = hashlib.sha256(content).hexdigest() + suffix
+        assets[filename] = content
+        bundled_src = f"{quote(asset_dir_name, safe='')}/{filename}"
+        if isinstance(image, dict):
+            image["src"] = bundled_src
+        else:
+            owner[key] = bundled_src
+    return prepared, assets
+
+
+def write_plan(data: Any, spec_dir: Path, output_path: Path) -> None:
+    """Validate and package a portable HTML plus its local image directory."""
+    validate_plan(data)
+    asset_dir_name = output_path.stem + "-assets"
+    prepared, assets = prepare_local_images(data, spec_dir, asset_dir_name)
+    rendered = build_html(prepared)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Stage the complete page before replacing an existing HTML output.
+    with tempfile.TemporaryDirectory(prefix=".travel-plan-", dir=output_path.parent) as temp_dir:
+        staging = Path(temp_dir)
+        staged_html = staging / "plan.html"
+        staged_html.write_text(rendered, encoding="utf-8")
+        if assets:
+            staged_assets = staging / "assets"
+            staged_assets.mkdir()
+            for filename, content in assets.items():
+                (staged_assets / filename).write_bytes(content)
+            asset_dir = output_path.parent / asset_dir_name
+            asset_dir.mkdir(exist_ok=True)
+            for filename in assets:
+                (staged_assets / filename).replace(asset_dir / filename)
+        staged_html.replace(output_path)
 
 
 def render_meta(items: list[Any]) -> str:
@@ -84,27 +242,28 @@ def render_route(route: list[Any]) -> str:
 def render_visual_anchors(items: list[Any]) -> str:
     cards = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
         image = item.get("image") or item.get("photo")
         src = image_src(image)
-        if not src:
-            continue
         credit = image_credit_html(image)
         day = escape(item.get("day") or item.get("label") or "")
         name = escape(item.get("name") or item.get("title") or "")
-        description = escape(item.get("description") or item.get("note") or "")
-        cards.append(
-            f"""
-            <article class="anchor-card">
+        description = escape(item.get("description") or "")
+        note = escape(item.get("note") or "")
+        image_html = f"""
               <figure>
                 <img src="{escape(src)}" alt="{name or day or 'Travel highlight'}" loading="lazy">
                 {f'<figcaption>{credit}</figcaption>' if credit else ''}
               </figure>
+        """ if src else '<p class="missing-image">未配图</p>'
+        cards.append(
+            f"""
+            <article class="anchor-card">
+              {image_html}
               <div>
                 {f'<span>{day}</span>' if day else ''}
                 {f'<h3>{name}</h3>' if name else ''}
                 {f'<p>{description}</p>' if description else ''}
+                {f'<p>{note}</p>' if note and note != description else ''}
               </div>
             </article>
             """
@@ -223,6 +382,7 @@ def render_sources(items: list[Any]) -> str:
 
 
 def build_html(data: dict[str, Any]) -> str:
+    validate_plan(data)
     title = escape(data.get("title") or "Travel Plan")
     subtitle = escape(data.get("subtitle") or "")
     hero = data.get("hero_image") or data.get("hero")
@@ -237,7 +397,6 @@ def build_html(data: dict[str, Any]) -> str:
     days = "\n".join(
         render_day(day, index)
         for index, day in enumerate(as_list(data.get("days")), start=1)
-        if isinstance(day, dict)
     )
 
     return f"""<!doctype html>
@@ -388,6 +547,10 @@ def build_html(data: dict[str, Any]) -> str:
       color: var(--muted);
       line-height: 1.45;
     }}
+    .anchor-card .missing-image {{
+      padding: 18px 14px;
+      background: #e5f3ef;
+    }}
     .days {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
@@ -530,10 +693,12 @@ def main() -> int:
     args = parse_args()
     spec_path = Path(args.spec)
     output_path = Path(args.output)
-    data = json.loads(spec_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise SystemExit("Top-level JSON value must be an object.")
-    output_path.write_text(build_html(data), encoding="utf-8")
+    try:
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        write_plan(data, spec_path.resolve().parent, output_path)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(output_path)
     return 0
 

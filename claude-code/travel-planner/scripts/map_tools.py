@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Unified map tools with AMap primary and Baidu fallback."""
+"""Unified map tools; auto uses AMap and Baidu remains opt-in."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-from typing import Callable
-
 import amap_tools
 import baidu_tools
-
-
-ProviderCall = Callable[..., dict]
+from map_common import MODES, MapError, call_safely, compare_routes, error_result, nonnegative, options_from_args, route_options
+from route_comparison import PREFERENCES, compare_modes as compare_route_modes
 
 
 def provider_order(preferred: str) -> list[str]:
@@ -39,36 +36,24 @@ def run_with_fallback(
     preferred: str,
     call_name: str,
     *args,
+    **options,
 ) -> dict:
-    errors: list[str] = []
+    failures: list[dict] = []
     order = provider_order(preferred)
     for index, provider in enumerate(order):
-        if not provider_ready(provider):
-            if preferred != "auto":
-                try:
-                    if provider == "amap":
-                        provider_fn = getattr(amap_tools, call_name)
-                    else:
-                        provider_fn = getattr(baidu_tools, call_name)
-                    provider_fn(*args)
-                except SystemExit as exc:
-                    raise SystemExit(str(exc)) from exc
-            errors.append(f"{provider}: not configured")
-            continue
-        try:
-            if provider == "amap":
-                provider_fn: ProviderCall = getattr(amap_tools, call_name)
-            else:
-                provider_fn = getattr(baidu_tools, call_name)
-            result = provider_fn(*args)
-            result["provider_used"] = provider
+        provider_fn = getattr(amap_tools if provider == "amap" else baidu_tools, call_name)
+        # The provider validates configuration when it needs to fetch data. This also
+        # allows unsupported modes to fail before reading credentials or making calls.
+        result = call_safely(provider_fn, *args, **options)
+        result["provider_used"] = provider
+        if call_name == "route" and len(args) >= 3:
+            result.setdefault("mode", args[2])
+        if result["status"] == "ok":
             if preferred == "auto" and index > 0:
                 result["fallback_used"] = True
             return result
-        except SystemExit as exc:
-            errors.append(f"{provider}: {exc}")
-            continue
-    raise SystemExit(" ; ".join(errors) or "No map provider available")
+        failures.append(result)
+    return failures[-1] if failures else error_result(MapError("configuration_error", "No map provider available"))
 
 
 def compare_areas(
@@ -77,49 +62,43 @@ def compare_areas(
     mode: str,
     city: str | None,
     provider: str,
+    **options,
 ) -> dict:
-    if len(areas) < 2:
-        raise SystemExit("compare-areas requires at least two areas")
-    if not anchors:
-        raise SystemExit("compare-areas requires at least one anchor")
+    result = compare_routes(areas, anchors, mode, city, lambda area, anchor:
+                            run_with_fallback(provider, "route", area, anchor, mode, city, **options))
+    result["provider_order"] = provider_order(provider)
+    return result
 
-    ranked_areas = []
-    for area in areas:
-        anchor_routes = []
-        total_minutes = 0.0
-        for anchor in anchors:
-            route_result = run_with_fallback(provider, "route", area, anchor, mode, city)
-            anchor_routes.append(
-                {
-                    "anchor": anchor,
-                    "provider_used": route_result["provider_used"],
-                    "resolved_mode": route_result["resolved_mode"],
-                    "duration_minutes": route_result["duration_minutes"],
-                    "distance_km": route_result["distance_km"],
-                }
-            )
-            total_minutes += route_result["duration_minutes"]
-        ranked_areas.append(
-            {
-                "area": area,
-                "average_duration_minutes": round(total_minutes / len(anchors), 1),
-                "anchors": anchor_routes,
-            }
-        )
 
-    ranked_areas.sort(key=lambda item: item["average_duration_minutes"])
-    return {
-        "mode": mode,
-        "city": city,
-        "provider_order": provider_order(provider),
-        "anchors": anchors,
-        "ranked_areas": ranked_areas,
-    }
+def compare_modes(
+    origin: str,
+    destination: str,
+    modes: list[str] | None = None,
+    city: str | None = None,
+    provider: str = "auto",
+    *,
+    preference: str = "fastest",
+    max_total_walk_km: float | None = None,
+    origin_city: str | None = None,
+    destination_city: str | None = None,
+) -> dict:
+    return compare_route_modes(
+        origin, destination,
+        modes if modes is not None else ["subway", "taxi", "walking", "bus"],
+        city, provider,
+        lambda mode, **options: run_with_fallback(
+            provider, "route", origin, destination, mode, city, **options
+        ),
+        preference=preference,
+        max_total_walk_km=max_total_walk_km,
+        origin_city=origin_city,
+        destination_city=destination_city,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified map tools with AMap primary and Baidu fallback"
+        description="Unified map tools; auto uses AMap, Baidu is opt-in"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -135,12 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     route_parser = subparsers.add_parser("route")
     route_parser.add_argument("--origin", required=True)
     route_parser.add_argument("--destination", required=True)
-    route_parser.add_argument(
-        "--mode",
-        choices=("walking", "driving", "transit"),
-        default="transit",
-    )
-    route_parser.add_argument("--city")
+    route_options(route_parser)
     route_parser.add_argument(
         "--provider",
         choices=("auto", "amap", "baidu"),
@@ -150,17 +124,28 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser = subparsers.add_parser("compare-areas")
     compare_parser.add_argument("--areas", nargs="+", required=True)
     compare_parser.add_argument("--anchors", nargs="+", required=True)
-    compare_parser.add_argument(
-        "--mode",
-        choices=("walking", "driving", "transit"),
-        default="transit",
-    )
-    compare_parser.add_argument("--city")
+    route_options(compare_parser)
     compare_parser.add_argument(
         "--provider",
         choices=("auto", "amap", "baidu"),
         default="auto",
     )
+
+    modes_parser = subparsers.add_parser(
+        "compare-modes", help="Compare travel modes for the same origin and destination"
+    )
+    modes_parser.add_argument("--origin", required=True)
+    modes_parser.add_argument("--destination", required=True)
+    modes_parser.add_argument("--modes", nargs="+", choices=MODES,
+                              default=["subway", "taxi", "walking", "bus"])
+    modes_parser.add_argument("--city", help="Common city hint for both endpoints")
+    modes_parser.add_argument("--origin-city", help="Overrides --city for origin")
+    modes_parser.add_argument("--destination-city", help="Overrides --city for destination")
+    modes_parser.add_argument("--provider", choices=("auto", "amap", "baidu"), default="auto")
+    modes_parser.add_argument("--preference", choices=tuple(PREFERENCES),
+                              default="fastest", help="Criterion for a suggestion; all options remain visible")
+    modes_parser.add_argument("--max-total-walk-km", type=nonnegative,
+                              help="Optional walking limit per route, including transit connections")
     return parser
 
 
@@ -178,21 +163,29 @@ def main() -> int:
             args.destination,
             args.mode,
             args.city,
+            **options_from_args(args),
         )
     elif args.command == "compare-areas":
-        result = compare_areas(
+        result = call_safely(compare_areas,
             args.areas,
             args.anchors,
             args.mode,
             args.city,
             args.provider,
+            **options_from_args(args),
+        )
+    elif args.command == "compare-modes":
+        result = call_safely(
+            compare_modes, args.origin, args.destination, args.modes, args.city, args.provider,
+            preference=args.preference, max_total_walk_km=args.max_total_walk_km,
+            origin_city=args.origin_city, destination_city=args.destination_city,
         )
     else:
         raise SystemExit(f"Unknown command: {args.command}")
 
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
-    return 0
+    return 0 if result["status"] == "ok" else 1
 
 
 if __name__ == "__main__":
